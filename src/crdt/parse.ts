@@ -151,6 +151,50 @@ function parseMessage(
 }
 
 /**
+ * 因果环检测：消息 m 的“先后发生”边指向自身链前序 F#(n-1)，以及 ctx 中
+ * 每个其他终端 U 的 U#ctx[U]（产生时已观察到的最新事件）。若该关系成环
+ * （两个终端直接互相依赖，或经更多终端间接互相依赖），则不存在任何真实
+ * 的发生顺序能产生这些上下文：记录不可能是断网期间的实际观察历史。
+ * 返回成环的事件 id 路径（不含闭合点），无环返回 null。
+ */
+function findCausalCycle(terminals: string[], messages: Message[]): string[] | null {
+  const byId = new Map(messages.map((m) => [m.id, m]));
+  const depsOf = (m: Message): string[] => {
+    const deps: string[] = [];
+    if (m.seq > 1) deps.push(`${m.from}#${m.seq - 1}`);
+    for (const u of terminals) {
+      if (u === m.from) continue;
+      const v = m.ctx[u] ?? 0;
+      if (v > 0) deps.push(`${u}#${v}`);
+    }
+    return deps;
+  };
+  const color = new Map<string, 1 | 2>(); // 1=在搜索栈上，2=已完成
+  const stack: string[] = [];
+  const visit = (id: string): string[] | null => {
+    color.set(id, 1);
+    stack.push(id);
+    for (const dep of depsOf(byId.get(id)!)) {
+      if (!byId.has(dep)) continue;
+      const c = color.get(dep);
+      if (c === 2) continue;
+      if (c === 1) return stack.slice(stack.indexOf(dep));
+      const found = visit(dep);
+      if (found) return found;
+    }
+    stack.pop();
+    color.set(id, 2);
+    return null;
+  };
+  for (const m of messages) {
+    if (color.has(m.id)) continue;
+    const found = visit(m.id);
+    if (found) return found;
+  }
+  return null;
+}
+
+/**
  * 解析并校验场景。任何非法输入都会定位到具体 JSON 路径并整体拒绝，
  * 调用方应据此清除旧回放。
  */
@@ -253,6 +297,19 @@ export function parseScenario(
         }
       }
       prev = m.ctx;
+    }
+  }
+
+  // ---- 因果环：跨终端上下文直接或间接互相依赖时不存在真实发生顺序，整体拒绝 ----
+  // （须在上下文合法性检查全部通过后进行，此时依赖边指向的事件均存在）
+  if (errors.length === 0) {
+    const cycle = findCausalCycle(terminals, messages);
+    if (cycle) {
+      err(
+        `$.messages[${cycle[0]}].ctx`,
+        `非法上下文：因果依赖成环（${[...cycle, cycle[0]].join(' → ')}），` +
+          `不存在真实的先后发生顺序，不可能是断网期间的实际观察历史`,
+      );
     }
   }
 
