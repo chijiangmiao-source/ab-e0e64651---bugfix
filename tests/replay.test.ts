@@ -114,6 +114,19 @@ describe('回放：收敛、暂存释放、重复幂等', () => {
     }
   });
 
+  it('内置样例：前三个合法且收敛，因果环样例被拒绝', () => {
+    for (let i = 0; i < 3; i += 1) {
+      const r = runReplay(SAMPLES[i].data);
+      expect(r.ok, `样例 ${SAMPLES[i].name} 应合法`).toBe(true);
+      if (r.ok) expect(r.converged, `样例 ${SAMPLES[i].name} 应收敛`).toBe(true);
+    }
+    const bad = runReplay(SAMPLES[3].data);
+    expect(bad.ok).toBe(false);
+    if (!bad.ok) {
+      expect(bad.errors.map((e) => e.message).join('\n')).toContain('互相依赖成环');
+    }
+  });
+
   it('回放是确定性的：同一场景两次运行结果一致', () => {
     const a = runReplay(SAMPLES[0].data);
     const b = runReplay(SAMPLES[0].data);
@@ -130,5 +143,81 @@ describe('回放：收敛、暂存释放、重复幂等', () => {
     if (r.ok) return;
     expect(r.errors.some((e) => e.message.includes('点标识复用'))).toBe(true);
     expect('steps' in r).toBe(false);
+  });
+
+  it('两终端互相依赖的因果环：整体拒绝、清除旧回放、不产生任何步骤', () => {
+    const cyclic = {
+      terminals: ['A', 'B'],
+      messages: [
+        {
+          id: 'A#1',
+          kind: 'add',
+          dot: 'D-01',
+          tag: { zone: 'Z-1', lat: 39.9, lng: 116.4, radiusKm: 3 },
+          ctx: { A: 1 },
+        },
+        {
+          // B 的首条新增声称已经见过 A 随后的撤销
+          id: 'B#1',
+          kind: 'add',
+          dot: 'D-02',
+          tag: { zone: 'Z-1', lat: 39.8, lng: 116.3, radiusKm: 3 },
+          ctx: { B: 1, A: 2 },
+        },
+        // A 的后续撤销又声称已经见过 B 的新增
+        { id: 'A#2', kind: 'remove', zone: 'Z-1', ctx: { A: 2, B: 1 } },
+      ],
+      inbox: {
+        A: ['A#1', 'A#2', 'B#1'],
+        B: ['B#1', 'A#2', 'A#1'],
+      },
+    };
+    const r = runReplay(cyclic);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    const joined = r.errors.map((e) => `${e.path} ${e.message}`).join('\n');
+    expect(joined).toContain('互相依赖成环');
+    expect(joined).toContain('不能按乱序投递处理');
+    expect(r.errors.some((e) => e.path === '$.messages[B#1].ctx')).toBe(true);
+    expect(r.errors.some((e) => e.path === '$.messages[A#2].ctx')).toBe(true);
+    // 拒绝结果不得携带任何回放步骤 / 收敛结论
+    expect('steps' in r).toBe(false);
+    expect('converged' in r).toBe(false);
+    expect('finalZones' in r).toBe(false);
+  });
+
+  it('更长的间接依赖链（A#2→C#1→B#1→A#2）：整体拒绝且不产生步骤', () => {
+    const tag = { zone: 'Z-1', lat: 39.9, lng: 116.4, radiusKm: 3 };
+    const cyclic = {
+      terminals: ['A', 'B', 'C'],
+      messages: [
+        { id: 'A#1', kind: 'add', dot: 'D-01', tag, ctx: { A: 1 } },
+        { id: 'A#2', kind: 'remove', zone: 'Z-1', ctx: { A: 2, B: 1 } },
+        { id: 'B#1', kind: 'add', dot: 'D-02', tag, ctx: { B: 1, C: 1 } },
+        { id: 'C#1', kind: 'add', dot: 'D-03', tag, ctx: { C: 1, A: 2 } },
+      ],
+      inbox: {
+        A: ['A#1', 'A#2', 'B#1', 'C#1'],
+        B: ['B#1', 'A#1', 'C#1', 'A#2'],
+        C: ['C#1', 'A#1', 'B#1', 'A#2'],
+      },
+    };
+    const r = runReplay(cyclic);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.errors.map((e) => e.message).join('\n')).toContain('互相依赖成环');
+    expect('steps' in r).toBe(false);
+  });
+
+  it('普通非法上下文仍被定位拒绝（回归）', () => {
+    const bad = structuredClone(SAMPLES[1].data) as {
+      messages: Array<{ id: string; ctx: Record<string, number> }>;
+    };
+    bad.messages[0].ctx = { A: 2 }; // ctx[自身] ≠ 自身序号
+    const rejected = runReplay(bad);
+    expect(rejected.ok).toBe(false);
+    if (rejected.ok) return;
+    expect(rejected.errors.some((e) => e.message.includes('自身序号'))).toBe(true);
+    expect('steps' in rejected).toBe(false);
   });
 });

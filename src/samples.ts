@@ -1,4 +1,4 @@
-/** 内置样例场景：覆盖并发新增/撤销收敛、乱序暂存释放、重复投递幂等 */
+/** 内置样例场景：并发新增/撤销收敛、乱序暂存释放、重复投递幂等、因果环整体拒绝 */
 
 export interface Sample {
   name: string;
@@ -97,8 +97,36 @@ const duplicateDelivery = {
   },
 };
 
+const cyclicDependency = {
+  // 非法场景：B#1 声称已见 A#2，而 A#2 又声称已见 B#1 —— 因果上下文互相
+  // 依赖成环，不存在真实发生顺序，必须整体拒绝、清除旧回放（不产生任何步骤）。
+  terminals: ['A', 'B'],
+  messages: [
+    {
+      id: 'A#1',
+      kind: 'add',
+      dot: 'D-31',
+      tag: { zone: 'Z-LOOP', lat: 39.9, lng: 116.4, radiusKm: 3 },
+      ctx: { A: 1 },
+    },
+    {
+      id: 'B#1',
+      kind: 'add',
+      dot: 'D-32',
+      tag: { zone: 'Z-LOOP', lat: 39.8, lng: 116.3, radiusKm: 3 },
+      ctx: { B: 1, A: 2 },
+    },
+    { id: 'A#2', kind: 'remove', zone: 'Z-LOOP', ctx: { A: 2, B: 1 } },
+  ],
+  inbox: {
+    A: ['A#1', 'A#2', 'B#1'],
+    B: ['B#1', 'A#2', 'A#1'],
+  },
+};
+
 export const SAMPLES: Sample[] = [
   { name: '并发新增与撤销（add-wins 收敛）', data: concurrentAddRemove },
   { name: '乱序投递与暂存释放', data: outOfOrderRelease },
   { name: '重复投递幂等（四终端）', data: duplicateDelivery },
+  { name: '因果环（非法，应整体拒绝）', data: cyclicDependency },
 ];

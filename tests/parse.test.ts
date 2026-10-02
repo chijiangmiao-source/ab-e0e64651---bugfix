@@ -156,3 +156,104 @@ describe('场景校验', () => {
     expect(parseScenario(s).ok).toBe(true);
   });
 });
+
+describe('全局因果序无环校验', () => {
+  const tag1 = { zone: 'Z1', lat: 1, lng: 2, radiusKm: 1 };
+
+  function expectCycleRejected(s: unknown, members: string[]) {
+    const r = parseScenario(s);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    const joined = r.errors.map((e) => e.message).join('\n');
+    expect(joined).toContain('互相依赖成环');
+    expect(joined).toContain('不存在真实发生顺序');
+    // 环上每个事件都应被定位
+    for (const id of members) {
+      expect(
+        r.errors.some((e) => e.path === `$.messages[${id}].ctx` && e.message.includes(id)),
+        `应在 ctx 位置定位环上事件 ${id}，实际：${JSON.stringify(r.errors)}`,
+      ).toBe(true);
+    }
+  }
+
+  it('拒绝两终端直接互相依赖：B#1 已见 A#2，而 A#2 又已见 B#1', () => {
+    const s = {
+      terminals: ['A', 'B'],
+      messages: [
+        { id: 'A#1', kind: 'add', dot: 'D1', tag: tag1, ctx: { A: 1 } },
+        { id: 'B#1', kind: 'add', dot: 'D2', tag: tag1, ctx: { B: 1, A: 2 } },
+        { id: 'A#2', kind: 'remove', zone: 'Z1', ctx: { A: 2, B: 1 } },
+      ],
+      inbox: { A: ['A#1', 'A#2', 'B#1'], B: ['B#1', 'A#2', 'A#1'] },
+    };
+    expectCycleRejected(s, ['A#2', 'B#1']);
+  });
+
+  it('拒绝更长的间接依赖链：A#2 → C#1 → B#1 → A#2', () => {
+    const s = {
+      terminals: ['A', 'B', 'C'],
+      messages: [
+        { id: 'A#1', kind: 'add', dot: 'D1', tag: tag1, ctx: { A: 1 } },
+        { id: 'A#2', kind: 'remove', zone: 'Z1', ctx: { A: 2, B: 1 } },
+        { id: 'B#1', kind: 'add', dot: 'D2', tag: tag1, ctx: { B: 1, C: 1 } },
+        { id: 'C#1', kind: 'add', dot: 'D3', tag: tag1, ctx: { C: 1, A: 2 } },
+      ],
+      inbox: {
+        A: ['A#1', 'A#2', 'B#1', 'C#1'],
+        B: ['B#1', 'A#1', 'C#1', 'A#2'],
+        C: ['C#1', 'A#1', 'B#1', 'A#2'],
+      },
+    };
+    expectCycleRejected(s, ['A#2', 'B#1', 'C#1']);
+  });
+
+  it('拒绝四终端间接依赖链：A#2 → D#1 → C#1 → B#1 → A#2', () => {
+    const s = {
+      terminals: ['A', 'B', 'C', 'D'],
+      messages: [
+        { id: 'A#1', kind: 'add', dot: 'D1', tag: tag1, ctx: { A: 1 } },
+        { id: 'A#2', kind: 'remove', zone: 'Z1', ctx: { A: 2, D: 1 } },
+        { id: 'D#1', kind: 'add', dot: 'D4', tag: tag1, ctx: { D: 1, C: 1 } },
+        { id: 'C#1', kind: 'add', dot: 'D3', tag: tag1, ctx: { C: 1, B: 1 } },
+        { id: 'B#1', kind: 'add', dot: 'D2', tag: tag1, ctx: { B: 1, A: 2 } },
+      ],
+      inbox: {
+        A: ['A#1', 'A#2', 'B#1', 'C#1', 'D#1'],
+        B: ['B#1', 'A#1', 'A#2', 'C#1', 'D#1'],
+        C: ['C#1', 'A#1', 'B#1', 'A#2', 'D#1'],
+        D: ['D#1', 'A#1', 'B#1', 'C#1', 'A#2'],
+      },
+    };
+    expectCycleRejected(s, ['A#2', 'B#1', 'C#1', 'D#1']);
+  });
+
+  it('接受不成环的跨终端观察（菱形依赖）', () => {
+    const s = {
+      terminals: ['A', 'B', 'C'],
+      messages: [
+        { id: 'A#1', kind: 'add', dot: 'D1', tag: tag1, ctx: { A: 1 } },
+        { id: 'B#1', kind: 'add', dot: 'D2', tag: tag1, ctx: { B: 1, A: 1 } },
+        { id: 'C#1', kind: 'add', dot: 'D3', tag: tag1, ctx: { C: 1, A: 1 } },
+        { id: 'C#2', kind: 'remove', zone: 'Z1', ctx: { C: 2, A: 1, B: 1 } },
+      ],
+      inbox: {
+        A: ['A#1', 'B#1', 'C#1', 'C#2'],
+        B: ['B#1', 'A#1', 'C#1', 'C#2'],
+        C: ['C#1', 'A#1', 'B#1', 'C#2'],
+      },
+    };
+    expect(parseScenario(s).ok).toBe(true);
+  });
+
+  it('长自身链（1000 条）不成环且不溢出', () => {
+    const messages: Array<Record<string, unknown>> = [];
+    const inbox: Record<string, string[]> = { A: [], B: [] };
+    for (let n = 1; n <= 1000; n += 1) {
+      messages.push({ id: `A#${n}`, kind: 'add', dot: `D${n}`, tag: tag1, ctx: { A: n } });
+      inbox.A.push(`A#${n}`);
+      inbox.B.push(`A#${n}`);
+    }
+    const r = parseScenario({ terminals: ['A', 'B'], messages, inbox });
+    expect(r.ok).toBe(true);
+  });
+});

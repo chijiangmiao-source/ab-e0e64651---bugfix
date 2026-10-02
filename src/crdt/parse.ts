@@ -256,6 +256,77 @@ export function parseScenario(
     }
   }
 
+  // ---- 全局因果序无环：所有“产生时已见”关系必须构成 DAG ----
+  // 每条 ctx 依赖都是严格的 happens-before 边：
+  //   - 自身前序 T#1..T#(n-1) → T#n
+  //   - 跨终端 U#ctx[U] → 本条（ctx[U] > 0 且 U ≠ 发送方）
+  // 成环意味着消息直接或间接互相依赖，不可能对应断网期间的任何真实
+  // 观察历史，不能按乱序暂存处理，必须整体拒绝、清除旧回放。
+  if (errors.length === 0) {
+    const adj = new Map<string, Set<string>>();
+    for (const m of messages) adj.set(m.id, new Set());
+    const addEdge = (from: string, to: string) => {
+      adj.get(from)!.add(to);
+    };
+    for (const m of messages) {
+      for (let k = 1; k < m.seq; k += 1) addEdge(`${m.from}#${k}`, m.id);
+      for (const u of terminals) {
+        if (u === m.from) continue;
+        const c = m.ctx[u] ?? 0;
+        if (c > 0) addEdge(`${u}#${c}`, m.id);
+      }
+    }
+
+    // 迭代式 DFS 三色着色，命中灰色节点即回边，提取该回边构成的环
+    const color = new Map<string, 0 | 1 | 2>();
+    for (const id of adj.keys()) color.set(id, 0);
+    let cycle: string[] | null = null;
+    for (const root of adj.keys()) {
+      if (color.get(root) !== 0) continue;
+      const stack: Array<{ id: string; next: number }> = [{ id: root, next: 0 }];
+      const path: string[] = [root];
+      color.set(root, 1);
+      while (stack.length > 0) {
+        const frame = stack[stack.length - 1];
+        const neighbors = [...adj.get(frame.id)!];
+        if (frame.next < neighbors.length) {
+          const v = neighbors[frame.next];
+          frame.next += 1;
+          const cv = color.get(v)!;
+          if (cv === 0) {
+            color.set(v, 1);
+            path.push(v);
+            stack.push({ id: v, next: 0 });
+          } else if (cv === 1) {
+            cycle = [...path.slice(path.indexOf(v)), v];
+            break;
+          }
+        } else {
+          color.set(frame.id, 2);
+          path.pop();
+          stack.pop();
+        }
+      }
+      if (cycle) break;
+    }
+
+    if (cycle) {
+      const ring = cycle;
+      const k = ring.length - 1; // ring[k] === ring[0]
+      // 环上每个事件都定位一条错误，路径指向其 ctx，正文给出以该事件首尾的成环链
+      for (let i = 0; i < k; i += 1) {
+        const id = ring[i];
+        const rotated = [...ring.slice(i, k), ...ring.slice(0, i), id];
+        err(
+          `$.messages[${id}].ctx`,
+          `非法场景：因果上下文互相依赖成环，不存在真实发生顺序（不能按乱序投递处理）：${rotated.join(
+            ' → ',
+          )}；${id} 声称已见的更早观察反过来又以 ${id} 为前序`,
+        );
+      }
+    }
+  }
+
   // ---- 点标识复用：同一 dot 必须对应相同载荷，否则拒绝 ----
   const byDot = new Map<string, AddMessage[]>();
   for (const m of messages) {

@@ -38,6 +38,8 @@
 - 事件 id 形如 `终端#序号`，每台终端的序号 1..k 连续；
 - **点标识复用但载荷不同**拒绝（同 dot 同载荷视为重复广播，幂等无害）；
 - **非法上下文**拒绝：`ctx[自身] ≠ 自身序号`、引用未知终端、负值/非整数、观察到不存在的未来事件、沿链回退（已见集合不可收缩）；
+- **因果依赖成环**拒绝：把每条 ctx 依赖视为严格的 happens-before 边（自身前序与跨终端“已见”），若全图出现回边（如 `B#1` 声称已见 `A#2`，而 `A#2` 又声称已见 `B#1`，含更长的间接依赖链），说明不存在任何真实发生顺序，**不得按乱序暂存处理**，将整体拒绝、清除旧回放，并在环上各事件的 `$.messages[<id>].ctx` 处定位；
+- 不成环的跨终端观察（含菱形依赖）始终合法；
 - 收件顺序须覆盖全部消息（保证可收敛），允许重复投递。
 
 ## 本地开发
@@ -61,7 +63,7 @@ docker compose up --build --abort-on-container-exit --exit-code-from verify
 echo $?   # 0 = 全部通过
 ```
 
-`verify` 服务依次执行：`vitest run`（并发新增与撤销收敛、乱序暂存释放、重复投递幂等、非法输入拒绝）→ `tsc + vite build` → 对 `web` 服务的 `/health` 与 `/` 做 HTTP 冒烟，全部通过退出 0，否则非零。
+`verify` 服务依次执行：`vitest run`（并发新增与撤销 add-wins 收敛、乱序暂存释放、重复投递幂等、两终端互相依赖与长间接依赖链的因果环整体拒绝、非法输入定位）→ `tsc + vite build` → 对 `web` 服务的 `/health` 与 `/` 做 HTTP 冒烟，全部通过退出 0，否则非零。
 
 ## 目录结构
 
@@ -69,7 +71,7 @@ echo $?   # 0 = 全部通过
 src/crdt/      纯 TS 核心：types / parse(校验) / engine(副本) / replay(回放)
 src/worker/    回放计算 Web Worker
 src/ui/        React 组件（编辑器、控制条、终端面板、步骤日志）
-src/samples.ts 内置样例（并发收敛 / 乱序释放 / 重复幂等）
+src/samples.ts 内置样例（并发收敛 / 乱序释放 / 重复幂等 / 因果环拒绝）
 tests/         vitest 测试
 Dockerfile     多阶段：deps / build / verify / web(nginx)
 docker-compose.yml  web（健康检查 + 可配端口）与 verify（一次性验收）
